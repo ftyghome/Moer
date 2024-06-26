@@ -1,6 +1,6 @@
 {
   "renderer": {
-    "spp": 16,
+    "spp": 4,
     "output_file": "green_bathroom"
   },
   "mediums": [],
@@ -594,13 +594,13 @@
     }
   ],
   "camera": {
-    "type": "thinlens",
+    "type": "pinhole",
     "fov": 50,
     "aperture_radius": 0.1,
-    "focus_distance": 10,
+    "focus_distance": 3,
     "resolution": [
-      1400,
-      900
+      700,
+      450
     ],
     "transform": {
       "position": [
