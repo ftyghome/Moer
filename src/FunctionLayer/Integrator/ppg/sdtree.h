@@ -10,6 +10,7 @@ enum class SpatialSplitType {
 struct SDTreeSampleResult {
     Vec3d direction;
     double pdf;
+    double flux;
 };
 
 inline std::pair<double, double> convert_cart2sphe(const Vec3d &direction) {
@@ -154,7 +155,7 @@ struct DirectionalTree {
         });
     }
 
-    SDTreeSampleResult getSample(double randNum) {
+    SDTreeSampleResult getSample(double randNum) const {
         auto cur_node = root;
         double pdf = 1 / (4 * M_PI);
         Point2d minP{0, 0}, maxP{1, 1};
@@ -175,12 +176,12 @@ struct DirectionalTree {
             pdf *= 4 * cur_node->quad[choice]->flux / cur_node->flux;
             cur_node = cur_node->quad[choice];
             const double interval = flux[choice] - (choice == 0 ? 0 : flux[choice - 1]);
-            randNum = randNum * flux[3] / interval;
+            randNum = (randNum * flux[3] - (choice == 0 ? 0 : flux[choice - 1])) / interval;
             assert(0 <= randNum && randNum <= 1);
         }
         const Point2d sampledP = minP + (maxP - minP) * randNum;
         const Vec3d direction = convert_2d2cart(sampledP.x, sampledP.y);
-        return {direction, pdf};
+        return {direction, pdf, cur_node->flux};
     }
 };
 
@@ -276,7 +277,7 @@ struct SDTree {
         stree->threshold = threshold;
     }
 
-    SDTreeSampleResult getSampleFromPoint(const Point3d &point, const double randNum) {
+    SDTreeSampleResult sample(const Point3d &point, const double randNum) const{
         const auto spatial_node = stree->descentToNode(point);
         const auto sample = spatial_node->dtree->getSample(randNum);
         return sample;

@@ -31,9 +31,41 @@ PPGIntegrator::PPGIntegrator(std::shared_ptr<Camera> _camera,
 }
 
 PPGPath PPGIntegrator::getPPGPathBySDTree(const Ray &initial_ray, const std::shared_ptr<Scene> &scene) {
-    return getPPGPathByBSDF(initial_ray,scene);
-}
+    Ray ray = initial_ray;
+    Spectrum throughput{1.0};
+    PPGPath ppg_path(ray);
+    auto itsOpt = scene->intersect(ray);
+    int nBounces = 0;
+    PathIntegratorLocalRecord sampleScatterRecord;
+    ppg_path.verts.emplace_back(itsOpt, ray, sampleScatterRecord);
+    do {
+        if (!itsOpt.has_value()) break;
+        auto its = itsOpt.value();
+        if (its.material->getBxDF(its)->isNull()) {
+            ray = Ray{its.position + ray.direction * eps, ray.direction};
+            itsOpt = scene->intersect(ray);
+            continue;
+        }
+        nBounces++;
 
+        // Russian roulette.
+        double pSurvive = russianRoulette(throughput, nBounces);
+        if (sampler->sample1D() >= pSurvive) {
+            break;
+        }
+        // TODO: should I handle this?
+        // throughput /= pSurvive;
+
+        sampleScatterRecord = sampleScatter(its, ray);
+
+        if (sampleScatterRecord.f.isBlack() || sampleScatterRecord.pdf == 0) break;
+
+        ray = Ray{its.position + sampleScatterRecord.wi * eps, sampleScatterRecord.wi};
+        itsOpt = scene->intersect(ray);
+        ppg_path.verts.emplace_back(itsOpt, ray, sampleScatterRecord);
+    } while (itsOpt.has_value());
+    return ppg_path;
+}
 
 PPGPath PPGIntegrator::getPPGPathByBSDF(const Ray &initial_ray, const std::shared_ptr<Scene> &scene) {
 
@@ -72,11 +104,11 @@ PPGPath PPGIntegrator::getPPGPathByBSDF(const Ray &initial_ray, const std::share
     } while (itsOpt.has_value());
     return ppg_path;
 }
-std::pair<Spectrum, PPGPath> PPGIntegrator::LiWithPathBySDTree(const Ray &initialRay, const std::shared_ptr<Scene> &scene) {
+std::pair<Spectrum, PPGPath> PPGIntegrator::LiWithPathBySDTree(const Ray &initialRay, const std::shared_ptr<Scene> &scene, const SDTree &tree) {
     Spectrum L{.0};
     auto box = scene->getGlobalBoundingBox();
     Spectrum throughput{1.0};
-    auto path = getPPGPathByBSDF(initialRay, scene);
+    auto path = getPPGPathBySDTree(initialRay, scene);
     for (size_t i = 0; i < path.verts.size(); i++) {
         auto &vert = path.verts[i];
 
@@ -104,21 +136,23 @@ std::pair<Spectrum, PPGPath> PPGIntegrator::LiWithPathBySDTree(const Ray &initia
         if (!itsOpt.has_value()) break;
         auto its = itsOpt.value();
 
-        //* ----- Direct lighting to the object, and reflect to the direction -----
-        for (int i = 0; i < nDirectLightSamples; ++i) {
-            PathIntegratorLocalRecord sampleLightRecord = sampleDirectLighting(scene, its, ray);
-            PathIntegratorLocalRecord evalScatterRecord = evalScatter(its, ray, sampleLightRecord.wi);
+        //* ----- SDTree Sampling -----
+        SDTreeSampleResult sampleSDTreeResult = tree.sample(its.position, sampler->sample1D());
+        PathIntegratorLocalRecord sampleSDTreeRecord = {.wi = -sampleSDTreeResult.direction,
+                                                        .f = sampleSDTreeResult.flux / 128,
+                                                        .pdf = sampleSDTreeResult.pdf,
+                                                        .isDelta = false};
+        PathIntegratorLocalRecord evalScatterRecord = evalScatter(its, ray, sampleSDTreeRecord.wi);
 
-            if (!sampleLightRecord.f.isBlack()) {
-                //* Multiple importance sampling
-                double misw = MISWeight(sampleLightRecord.pdf, evalScatterRecord.pdf);
-                if (sampleLightRecord.isDelta) {
-                    // * MIS will not be applied with delta distribution of light source.
-                    misw = 1.0;
-                }
-                vert.L += sampleLightRecord.f * evalScatterRecord.f / sampleLightRecord.pdf * misw / nDirectLightSamples;
-            }
+        //* Multiple importance sampling
+        double misw = MISWeight(sampleSDTreeRecord.pdf, evalScatterRecord.pdf);
+        if (sampleSDTreeRecord.isDelta) {
+            // * MIS will not be applied with delta distribution of light source.
+            misw = 1.0;
         }
+        vert.L += sampleSDTreeRecord.f * evalScatterRecord.f / sampleSDTreeRecord.pdf * misw;
+
+        //* End of SDTree Sampling
     }
 
     // Backward light collection
@@ -259,12 +293,12 @@ void PPGIntegrator::renderPerThread(std::shared_ptr<Scene> scene) {
                 // std::cout << "Applying path complete" << std::endl;
             }
             for (int i = 0; i < spp; i++) {
-                auto L = LiWithPathBySDTree(
+                auto [L, path] = LiWithPathBySDTree(
                     cam.generateRay(
                         film->getResolution(),
                         pixelPosition,
                         ssampler->getCameraSample()),
-                    scene).first;
+                    scene, cur_tree);
                 film->deposit(pixelPosition, L);
                 /**
                  * @warning spp used in this for loop belongs to Integrator.

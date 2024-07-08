@@ -38,7 +38,7 @@ public:
 
     virtual std::pair<Spectrum,PPGPath> LiWithPathByBSDF(const Ray &ray, const std::shared_ptr<Scene> & scene);
 
-    virtual std::pair<Spectrum,PPGPath> LiWithPathBySDTree(const Ray &ray, const std::shared_ptr<Scene> & scene);
+    virtual std::pair<Spectrum,PPGPath> LiWithPathBySDTree(const Ray &ray, const std::shared_ptr<Scene> &scene, const SDTree &tree);
 
     virtual void render(std::shared_ptr<Scene> scene) override;
 
@@ -59,6 +59,7 @@ public:
 
     virtual PathIntegratorLocalRecord sampleScatter(const Intersection &its,
                                                     const Ray &ray) override;
+
 
     virtual double russianRoulette(const Spectrum &T,
                                    int nBounce) override;
