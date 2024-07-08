@@ -28,7 +28,7 @@ PathIntegratorNew::PathIntegratorNew(std::shared_ptr<Camera> _camera,
 
 }
 
-Spectrum PathIntegratorNew::Li(const Ray &initialRay, 
+Spectrum PathIntegratorNew::Li(const Ray &initialRay,
                                std::shared_ptr<Scene> scene) 
 {
     const double eps = 1e-4;

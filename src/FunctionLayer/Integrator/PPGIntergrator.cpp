@@ -14,6 +14,8 @@
 #include "ppg/path.h"
 #include "FunctionLayer/Material/NullMaterial.h"
 
+#include <thread>
+
 const double eps = 1e-4;
 
 PPGIntegrator::PPGIntegrator(std::shared_ptr<Camera> _camera,
@@ -27,7 +29,13 @@ PPGIntegrator::PPGIntegrator(std::shared_ptr<Camera> _camera,
                                                                             _sampler, _spp,
                                                                             _renderThreadNum) {
 }
-PPGPath PPGIntegrator::getPPGPath(const Ray &initial_ray, std::shared_ptr<Scene> scene) {
+
+PPGPath PPGIntegrator::getPPGPathBySDTree(const Ray &initial_ray, const std::shared_ptr<Scene> &scene) {
+    return getPPGPathByBSDF(initial_ray,scene);
+}
+
+
+PPGPath PPGIntegrator::getPPGPathByBSDF(const Ray &initial_ray, const std::shared_ptr<Scene> &scene) {
 
     Ray ray = initial_ray;
     Spectrum throughput{1.0};
@@ -64,17 +72,17 @@ PPGPath PPGIntegrator::getPPGPath(const Ray &initial_ray, std::shared_ptr<Scene>
     } while (itsOpt.has_value());
     return ppg_path;
 }
-
-Spectrum PPGIntegrator::Li(const Ray &initialRay,
-                           std::shared_ptr<Scene> scene) {
+std::pair<Spectrum, PPGPath> PPGIntegrator::LiWithPathBySDTree(const Ray &initialRay, const std::shared_ptr<Scene> &scene) {
     Spectrum L{.0};
+    auto box = scene->getGlobalBoundingBox();
     Spectrum throughput{1.0};
-    auto path = getPPGPath(initialRay, scene);
+    auto path = getPPGPathByBSDF(initialRay, scene);
     for (size_t i = 0; i < path.verts.size(); i++) {
         auto &vert = path.verts[i];
 
         auto [itsOpt, ray, sampleScatterRecord, _] = vert;
 
+        //* ----- The object is emitting light (or just get the env light at infinity) -----
         auto evalLightRecord = evalEmittance(scene, itsOpt, ray);
 
         if (!evalLightRecord.f.isBlack()) {
@@ -93,10 +101,10 @@ Spectrum PPGIntegrator::Li(const Ray &initialRay,
 
             vert.L = evalLightRecord.f * misw;
         }
-        if(!itsOpt.has_value()) break;
+        if (!itsOpt.has_value()) break;
         auto its = itsOpt.value();
 
-        //* ----- Direct Illumination -----
+        //* ----- Direct lighting to the object, and reflect to the direction -----
         for (int i = 0; i < nDirectLightSamples; ++i) {
             PathIntegratorLocalRecord sampleLightRecord = sampleDirectLighting(scene, its, ray);
             PathIntegratorLocalRecord evalScatterRecord = evalScatter(its, ray, sampleLightRecord.wi);
@@ -108,7 +116,7 @@ Spectrum PPGIntegrator::Li(const Ray &initialRay,
                     // * MIS will not be applied with delta distribution of light source.
                     misw = 1.0;
                 }
-                vert.L = sampleLightRecord.f * evalScatterRecord.f / sampleLightRecord.pdf * misw / nDirectLightSamples;
+                vert.L += sampleLightRecord.f * evalScatterRecord.f / sampleLightRecord.pdf * misw / nDirectLightSamples;
             }
         }
     }
@@ -120,7 +128,160 @@ Spectrum PPGIntegrator::Li(const Ray &initialRay,
         prev.L += cur.L * cur.sampleScatterRecord.f / cur.sampleScatterRecord.pdf;
     }
 
-    return path.verts.empty() ? 0 : path.verts[0].L;
+    return {path.verts.empty() ? 0 : path.verts[0].L, path};
+}
+
+std::pair<Spectrum, PPGPath> PPGIntegrator::LiWithPathByBSDF(const Ray &initialRay,
+                                                             const std::shared_ptr<Scene> &scene) {
+    Spectrum L{.0};
+    auto box = scene->getGlobalBoundingBox();
+    Spectrum throughput{1.0};
+    auto path = getPPGPathByBSDF(initialRay, scene);
+    for (size_t i = 0; i < path.verts.size(); i++) {
+        auto &vert = path.verts[i];
+
+        auto [itsOpt, ray, sampleScatterRecord, _] = vert;
+
+        //* ----- The object is emitting light (or just get the env light at infinity) -----
+        auto evalLightRecord = evalEmittance(scene, itsOpt, ray);
+
+        if (!evalLightRecord.f.isBlack()) {
+            //* The continuous ray hit the emitter or hit nothing but environment lighting.
+            //* Multiple importance sampling
+            double misw;
+            if (i == 0) {
+                misw = 1;
+            } else {
+                misw = MISWeight(sampleScatterRecord.pdf, evalLightRecord.pdf);
+                if (sampleScatterRecord.isDelta) {
+                    //* MIS will not be applied with delta distribution of BSDF.
+                    misw = 1.0;
+                }
+            }
+
+            vert.L = evalLightRecord.f * misw;
+        }
+        if (!itsOpt.has_value()) break;
+        auto its = itsOpt.value();
+
+        //* ----- Direct lighting to the object, and reflect to the direction -----
+        for (int i = 0; i < nDirectLightSamples; ++i) {
+            PathIntegratorLocalRecord sampleLightRecord = sampleDirectLighting(scene, its, ray);
+            PathIntegratorLocalRecord evalScatterRecord = evalScatter(its, ray, sampleLightRecord.wi);
+
+            if (!sampleLightRecord.f.isBlack()) {
+                //* Multiple importance sampling
+                double misw = MISWeight(sampleLightRecord.pdf, evalScatterRecord.pdf);
+                if (sampleLightRecord.isDelta) {
+                    // * MIS will not be applied with delta distribution of light source.
+                    misw = 1.0;
+                }
+                vert.L += sampleLightRecord.f * evalScatterRecord.f / sampleLightRecord.pdf * misw / nDirectLightSamples;
+            }
+        }
+    }
+
+    // Backward light collection
+
+    for (size_t i = path.verts.size() - 1; i >= 1; i--) {
+        auto &cur = path.verts[i], &prev = path.verts[i - 1];
+        prev.L += cur.L * cur.sampleScatterRecord.f / cur.sampleScatterRecord.pdf;
+    }
+
+    return {path.verts.empty() ? 0 : path.verts[0].L, path};
+}
+void PPGIntegrator::render(std::shared_ptr<Scene> scene) {
+    std::vector<std::thread> threads;
+    for (int i = 0; i < renderThreadNum; i++) {
+        threads.emplace_back(&PPGIntegrator::renderPerThread, this, scene);
+    }
+
+    for (int i = 0; i < renderThreadNum; i++) {
+        threads[i].join();
+    }
+
+    printProgress(1.f);
+}
+void PPGIntegrator::renderPerThread(std::shared_ptr<Scene> scene) {
+    /**
+     * @warning Other part of Integrator uses the original sampler
+     *          so I have to fill its vectors here.
+     *          In fact every time a fresh sampler is needed we should
+     *          use Sampler::clone() to get one.
+     */
+    static int tileFinished = 0;
+
+    sampler->startPixel({0, 0});
+    auto ssampler = sampler->clone(0);
+    while (true) {
+        auto optionalTile = tileGenerator->generateNextTile();
+        if (optionalTile == std::nullopt)
+            break;
+        auto tile = optionalTile.value();
+
+        for (auto it = tile->begin(); it != tile->end(); ++it) {
+
+            auto bbox_ = scene->getGlobalBoundingBox();
+            BoundingBox3f bbox{Point3d{
+                                   bbox_.pMin.x - .1,
+                                   bbox_.pMin.y - .1,
+                                   bbox_.pMin.z - .1,
+                               },
+                               Point3d{
+                                   bbox_.pMax.x + .1,
+                                   bbox_.pMax.y + .1,
+                                   bbox_.pMax.z + .1}};
+
+            SDTree cur_tree(bbox), nxt_tree(bbox);
+
+            auto pixelPosition = *it;
+
+            const auto &cam = *this->camera;
+            /**
+             * @bug Sampler is NOT designed for multi-threads, need copy for each thread.
+             *      Sampler::clone() will return a Sampler copy, only with same sampling
+             *      strategy, random numbers are not guaranteed to be identical.
+             */
+            // sampler->startPixel(pixelPosition);
+            ssampler->startPixel(pixelPosition);
+
+            cur_tree.setSpatialSplitThreshold(12);
+
+            for (int i = 0; i < 1; i++) {
+                auto [L, path] = LiWithPathByBSDF(
+                    cam.generateRay(
+                        film->getResolution(),
+                        pixelPosition,
+                        ssampler->getCameraSample()),
+                    scene);
+                // std::cout << "Applying path " << std::endl;
+                cur_tree.applyPath(path);
+                // std::cout << "Applying path complete" << std::endl;
+            }
+            for (int i = 0; i < spp; i++) {
+                auto L = LiWithPathBySDTree(
+                    cam.generateRay(
+                        film->getResolution(),
+                        pixelPosition,
+                        ssampler->getCameraSample()),
+                    scene).first;
+                film->deposit(pixelPosition, L);
+                /**
+                 * @warning spp used in this for loop belongs to Integrator.
+                 *          It is irrelevant with spp passed to Sampler.
+                 *          And Sampler has no sanity check for subscript
+                 *          of sample vector. Error may occur if spp passed to
+                 *          Integrator is bigger than which passed to Sampler.
+                 */
+                ssampler->nextSample();
+            }
+        }
+
+        //* Finish one tile rendering
+        if (++tileFinished % 5) {
+            printProgress((float)tileFinished / tileGenerator->tileCount);
+        }
+    }
 }
 
 /// @brief Eval surface or infinite light source (on itsOpt) radiance and ignore medium transmittance.

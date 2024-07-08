@@ -14,6 +14,7 @@
 #include "CoreLayer/Ray/Ray.h"
 #include "AbstractPathIntegrator.h"
 #include "ppg/path.h"
+#include "ppg/sdtree.h"
 
 /**
  * @brief Unidirectional path-tracing integrator with new
@@ -31,9 +32,17 @@ public:
                        int _spp,
                        int _renderThreadNum = 4);
 
-    virtual PPGPath getPPGPath(const Ray &ray, std::shared_ptr<Scene> scene);
+    virtual PPGPath getPPGPathByBSDF(const Ray &ray, const std::shared_ptr<Scene> & scene);
 
-    virtual Spectrum Li(const Ray &ray, std::shared_ptr<Scene> scene) override;
+    virtual PPGPath getPPGPathBySDTree(const Ray &ray, const std::shared_ptr<Scene> & scene);
+
+    virtual std::pair<Spectrum,PPGPath> LiWithPathByBSDF(const Ray &ray, const std::shared_ptr<Scene> & scene);
+
+    virtual std::pair<Spectrum,PPGPath> LiWithPathBySDTree(const Ray &ray, const std::shared_ptr<Scene> & scene);
+
+    virtual void render(std::shared_ptr<Scene> scene) override;
+
+    void renderPerThread(std::shared_ptr<Scene> scene);
 
     virtual PathIntegratorLocalRecord evalEmittance(std::shared_ptr<Scene> scene,
                                                     std::optional<Intersection> itsOpt,

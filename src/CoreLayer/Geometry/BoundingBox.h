@@ -78,6 +78,14 @@ public:
 		double z = pMax[2] - pMin[2];
 		return 2 * (x * y + x * z + y * z);
 	}
+
+    bool contains(const Point3d &point) {
+	    if(point.x < pMin[0] || point.x > pMax[0]) return false;
+	    if(point.y < pMin[1] || point.y > pMax[1]) return false;
+	    if(point.z < pMin[2] || point.z > pMax[2]) return false;
+	    return true;
+	}
+
 };
 
 /**
