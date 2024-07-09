@@ -1,5 +1,6 @@
 #pragma once
 #include <set>
+#include <utility>
 
 enum class SpatialSplitType {
     SPLIT_X,
@@ -10,7 +11,7 @@ enum class SpatialSplitType {
 struct SDTreeSampleResult {
     Vec3d direction;
     double pdf;
-    double flux;
+    Spectrum f;
 };
 
 inline std::pair<double, double> convert_cart2sphe(const Vec3d &direction) {
@@ -46,14 +47,18 @@ struct LRecord {
 };
 
 struct DirectionalTreeNode {
-    double flux = 0;
+    Spectrum f = 0;
+
+    double getLuminance() const {
+        return f.luminance();
+    }
 
     std::shared_ptr<DirectionalTreeNode> quad[4];
 
-    DirectionalTreeNode(const double flux_) : flux(flux_) {}
+    DirectionalTreeNode(Spectrum f_) : f(std::move(f_)) {}
 
     DirectionalTreeNode(const DirectionalTreeNode &node) {
-        flux = node.flux;
+        f = node.f;
         if (node.quad[0]) {
             for (int i = 0; i < 4; i++) {
                 quad[i] = std::make_shared<DirectionalTreeNode>(*node.quad[i]);
@@ -78,50 +83,54 @@ struct DirectionalTree {
     }
 
     void testSplit(std::shared_ptr<DirectionalTreeNode> &node) {
-        assert(!node->quad[0]);
-        if (node->flux / root->flux > 0.1) {
+        if (node->quad[0]) return;
+        if ((node->f.luminance() / root->f.luminance()) > 0.01) {
             for (auto &i : node->quad) {
-                i = std::make_shared<DirectionalTreeNode>(node->flux / 4);
+                i = std::make_shared<DirectionalTreeNode>(node->f / 4);
             }
         }
     }
 
-    std::shared_ptr<DirectionalTreeNode> descentToNode(const double x, const double y, const std::function<void(const std::shared_ptr<DirectionalTreeNode> &)> &func) {
-        auto cur_node = root;
-        func(cur_node);
-        Point2d minP{0, 0}, maxP{1, 1};
-        if (!cur_node->quad[0]) {
-            testSplit(cur_node);
-            goto out;
-        }
-        while (cur_node->quad[0]) {
-            Point2d midP = minP + (maxP - minP) * 0.5;
-            if (x < midP.x) {
-                if (y < midP.y) {
-                    cur_node = cur_node->quad[0];
-                    coordDescent(minP, maxP, 0);
+    std::shared_ptr<DirectionalTreeNode> descentToNode(const double x, const double y, const Spectrum &f_) {
+
+        std::function<std::shared_ptr<DirectionalTreeNode>(std::shared_ptr<DirectionalTreeNode> & node, Point2d minP, Point2d maxP, const Spectrum &f)>
+            descent = [&](std::shared_ptr<DirectionalTreeNode> &node, Point2d minP, Point2d maxP, const Spectrum &f) -> std::shared_ptr<DirectionalTreeNode> {
+            std::shared_ptr<DirectionalTreeNode> ret;
+            testSplit(node);
+            if (node->quad[0]) {
+                Point2d midP = minP + (maxP - minP) * 0.5;
+                if (x < midP.x) {
+                    if (y < midP.y) {
+                        coordDescent(minP, maxP, 0);
+                        ret = descent(node->quad[0], minP, maxP, f / 4);
+                    } else {
+                        coordDescent(minP, maxP, 2);
+                        ret = descent(node->quad[2], minP, maxP, f / 4);
+                    }
                 } else {
-                    cur_node = cur_node->quad[2];
-                    coordDescent(minP, maxP, 2);
+                    if (y < midP.y) {
+                        coordDescent(minP, maxP, 1);
+                        ret = descent(node->quad[1], minP, maxP, f / 4);
+                    } else {
+                        coordDescent(minP, maxP, 3);
+                        ret = descent(node->quad[3], minP, maxP, f / 4);
+                    }
                 }
+                // node->f = (node->f + f) / 2;
+
+                node->f = 0;
+
+                for (auto &i : node->quad) {
+                    node->f += i->f;
+                }
+
             } else {
-                if (y < midP.y) {
-                    cur_node = cur_node->quad[1];
-                    coordDescent(minP, maxP, 1);
-                } else {
-                    cur_node = cur_node->quad[3];
-                    coordDescent(minP, maxP, 3);
-                }
+                node->f = (node->f + f) / 2;
+                ret = node;
             }
-            assert(cur_node);
-            func(cur_node);
-            if (!cur_node->quad[0]) {
-                testSplit(cur_node);
-                break;
-            }
-        }
-    out:
-        return cur_node;
+            return ret;
+        };
+        return descent(root, {0, 0}, {1, 1}, f_);
     }
 
     inline static void coordDescent(Point2d &minP, Point2d &maxP, int quadIdx) {
@@ -146,42 +155,44 @@ struct DirectionalTree {
         }
     }
 
-    void apply(const Vec3d &direction_, const double flux) {
+    void apply(const Vec3d &direction_, const Spectrum &f) {
         const auto direction = normalize(direction_);
         auto [x, y] = convert_cart22d(direction);
 
-        auto node = descentToNode(x, y, [=](const std::shared_ptr<DirectionalTreeNode> &inode) {
-            inode->flux += flux;
-        });
+        descentToNode(x, y, f);
     }
 
     SDTreeSampleResult getSample(double randNum) const {
+        double f_multiplier = 1;
         auto cur_node = root;
         double pdf = 1 / (4 * M_PI);
         Point2d minP{0, 0}, maxP{1, 1};
         while (!cur_node->isLeaf()) {
             int choice = 3;
-            double flux[4];
-            flux[0] = cur_node->quad[0]->flux;
+            double lumin[4];
+            lumin[0] = cur_node->quad[0]->getLuminance();
             for (int i = 1; i < 4; i++) {
-                flux[i] = flux[i - 1] + cur_node->quad[i]->flux;
+                lumin[i] = lumin[i - 1] + cur_node->quad[i]->getLuminance();
             }
             for (int i = 0; i < 4; i++) {
-                if (randNum < flux[i] / flux[3]) {
+                if (randNum < lumin[i] / lumin[3]) {
                     choice = i;
                     break;
                 }
             }
             coordDescent(minP, maxP, choice);
-            pdf *= 4 * cur_node->quad[choice]->flux / cur_node->flux;
+            double ratio = cur_node->quad[choice]->getLuminance() / cur_node->getLuminance();
+            pdf *= 4 * ratio;
             cur_node = cur_node->quad[choice];
-            const double interval = flux[choice] - (choice == 0 ? 0 : flux[choice - 1]);
-            randNum = (randNum * flux[3] - (choice == 0 ? 0 : flux[choice - 1])) / interval;
+            const double interval = lumin[choice] - (choice == 0 ? 0 : lumin[choice - 1]);
+            randNum = (randNum * lumin[3] - (choice == 0 ? 0 : lumin[choice - 1])) / interval;
             assert(0 <= randNum && randNum <= 1);
+            // f_multiplier *= 4;
         }
         const Point2d sampledP = minP + (maxP - minP) * randNum;
         const Vec3d direction = convert_2d2cart(sampledP.x, sampledP.y);
-        return {direction, pdf, cur_node->flux};
+        assert(0 <= pdf && pdf <= 1);
+        return {direction, pdf, cur_node->f * f_multiplier};
     }
 };
 
@@ -257,7 +268,7 @@ struct SpatialTree {
         const auto cur_spatial_node = descentToNode(record.point, true);
         assert(cur_spatial_node->dtree);
         const auto cur_directional_node = cur_spatial_node->dtree;
-        cur_directional_node->apply(record.direction, record.L.luminance());
+        cur_directional_node->apply(record.direction, record.L);
     }
 
     explicit SpatialTree(BoundingBox3f &bbox_) {
@@ -277,7 +288,7 @@ struct SDTree {
         stree->threshold = threshold;
     }
 
-    SDTreeSampleResult sample(const Point3d &point, const double randNum) const{
+    SDTreeSampleResult sample(const Point3d &point, const double randNum) const {
         const auto spatial_node = stree->descentToNode(point);
         const auto sample = spatial_node->dtree->getSample(randNum);
         return sample;

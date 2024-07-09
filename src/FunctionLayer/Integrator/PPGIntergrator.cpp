@@ -139,7 +139,7 @@ std::pair<Spectrum, PPGPath> PPGIntegrator::LiWithPathBySDTree(const Ray &initia
         //* ----- SDTree Sampling -----
         SDTreeSampleResult sampleSDTreeResult = tree.sample(its.position, sampler->sample1D());
         PathIntegratorLocalRecord sampleSDTreeRecord = {.wi = -sampleSDTreeResult.direction,
-                                                        .f = sampleSDTreeResult.flux / 128,
+                                                        .f = sampleSDTreeResult.f,
                                                         .pdf = sampleSDTreeResult.pdf,
                                                         .isDelta = false};
         PathIntegratorLocalRecord evalScatterRecord = evalScatter(its, ray, sampleSDTreeRecord.wi);
@@ -253,20 +253,41 @@ void PPGIntegrator::renderPerThread(std::shared_ptr<Scene> scene) {
             break;
         auto tile = optionalTile.value();
 
+        auto bbox_ = scene->getGlobalBoundingBox();
+        BoundingBox3f bbox{Point3d{
+                               bbox_.pMin.x - .1,
+                               bbox_.pMin.y - .1,
+                               bbox_.pMin.z - .1,
+                           },
+                           Point3d{
+                               bbox_.pMax.x + .1,
+                               bbox_.pMax.y + .1,
+                               bbox_.pMax.z + .1}};
+
+        SDTree cur_tree(bbox), nxt_tree(bbox);
+
+        cur_tree.setSpatialSplitThreshold(4);
+
+        const auto &cam = *this->camera;
+
         for (auto it = tile->begin(); it != tile->end(); ++it) {
+            auto pixelPosition = *it;
+            ssampler->startPixel(pixelPosition);
+            for (int i = 0; i < 32; i++) {
+                auto [L, path] = LiWithPathByBSDF(
+                    cam.generateRay(
+                        film->getResolution(),
+                        *it,
+                        ssampler->getCameraSample()),
+                    scene);
+                // std::cout << "Applying path " << std::endl;
+                cur_tree.applyPath(path);
+                // std::cout << "Applying path complete" << std::endl;
+                ssampler->nextSample();
+            }
+        }
 
-            auto bbox_ = scene->getGlobalBoundingBox();
-            BoundingBox3f bbox{Point3d{
-                                   bbox_.pMin.x - .1,
-                                   bbox_.pMin.y - .1,
-                                   bbox_.pMin.z - .1,
-                               },
-                               Point3d{
-                                   bbox_.pMax.x + .1,
-                                   bbox_.pMax.y + .1,
-                                   bbox_.pMax.z + .1}};
-
-            SDTree cur_tree(bbox), nxt_tree(bbox);
+        for (auto it = tile->begin(); it != tile->end(); ++it) {
 
             auto pixelPosition = *it;
 
@@ -279,19 +300,6 @@ void PPGIntegrator::renderPerThread(std::shared_ptr<Scene> scene) {
             // sampler->startPixel(pixelPosition);
             ssampler->startPixel(pixelPosition);
 
-            cur_tree.setSpatialSplitThreshold(12);
-
-            for (int i = 0; i < 1; i++) {
-                auto [L, path] = LiWithPathByBSDF(
-                    cam.generateRay(
-                        film->getResolution(),
-                        pixelPosition,
-                        ssampler->getCameraSample()),
-                    scene);
-                // std::cout << "Applying path " << std::endl;
-                cur_tree.applyPath(path);
-                // std::cout << "Applying path complete" << std::endl;
-            }
             for (int i = 0; i < spp; i++) {
                 auto [L, path] = LiWithPathBySDTree(
                     cam.generateRay(
